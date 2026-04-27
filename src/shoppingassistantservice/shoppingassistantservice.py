@@ -18,11 +18,19 @@ import os
 
 from google.cloud import secretmanager_v1
 from urllib.parse import unquote
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from flask import Flask, request
+from flask import Flask, jsonify, request
 
 from langchain_google_alloydb_pg import AlloyDBEngine, AlloyDBVectorStore
+
+from prompts import (
+    DESIGN_SYSTEM_PROMPT,
+    VISION_SYSTEM_PROMPT,
+    build_design_human_message,
+    build_vector_search_query,
+)
+from sanitize import SanitizationError, sanitize_image_url, sanitize_message
 
 PROJECT_ID = os.environ["PROJECT_ID"]
 REGION = os.environ["REGION"]
@@ -59,55 +67,71 @@ vectorstore = AlloyDBVectorStore.create_sync(
     metadata_columns=["id", "name", "categories"]
 )
 
+
 def create_app():
     app = Flask(__name__)
 
     @app.route("/", methods=['POST'])
     def talkToGemini():
         print("Beginning RAG call")
-        prompt = request.json['message']
-        prompt = unquote(prompt)
+        payload = request.get_json(silent=True) or {}
 
-        # Step 1 – Get a room description from Gemini-vision-pro
+        # Bound and sanitize untrusted inputs at the HTTP boundary before
+        # any prompt is constructed (R-020). Failure is HTTP 400, no LLM
+        # call is made, and no untrusted bytes reach the embedding API.
+        raw_message = payload.get('message')
+        if isinstance(raw_message, str):
+            raw_message = unquote(raw_message)
+        try:
+            prompt = sanitize_message(raw_message)
+            image_url = sanitize_image_url(payload.get('image'))
+        except SanitizationError as e:
+            return jsonify({'error': str(e)}), 400
+
+        # Step 1 - Get a room description from the vision model.
+        # System instruction is structurally separate from the user-supplied
+        # image URL.
         llm_vision = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
-        message = HumanMessage(
-            content=[
-                {
-                    "type": "text",
-                    "text": "You are a professional interior designer, give me a detailed decsription of the style of the room in this image",
-                },
-                {"type": "image_url", "image_url": request.json['image']},
-            ]
-        )
-        response = llm_vision.invoke([message])
+        vision_messages = [
+            SystemMessage(content=VISION_SYSTEM_PROMPT),
+            HumanMessage(
+                content=[
+                    {"type": "image_url", "image_url": image_url},
+                ]
+            ),
+        ]
+        response = llm_vision.invoke(vision_messages)
         print("Description step:")
         print(response)
         description_response = response.content
 
-        # Step 2 – Similarity search with the description & user prompt
-        vector_search_prompt = f""" This is the user's request: {prompt} Find the most relevant items for that prompt, while matching style of the room described here: {description_response} """
+        # Step 2 - Similarity search.
+        # The vector query is used for embedding/retrieval, not as an LLM
+        # instruction; injection here only degrades retrieval quality. We
+        # still cap the size to protect the embedding API.
+        vector_search_prompt = build_vector_search_query(prompt, description_response)
         print(vector_search_prompt)
 
         docs = vectorstore.similarity_search(vector_search_prompt)
         print(f"Vector search: {description_response}")
         print(f"Retrieved documents: {len(docs)}")
-        #Prepare relevant documents for inclusion in final prompt
         relevant_docs = ""
         for doc in docs:
             doc_details = doc.to_json()
             print(f"Adding relevant document to prompt context: {doc_details}")
             relevant_docs += str(doc_details) + ", "
 
-        # Step 3 – Tie it all together by augmenting our call to Gemini-pro
+        # Step 3 - Final recommendation.
+        # SystemMessage holds the immutable role and output format; the
+        # HumanMessage carries the three labeled, untrusted sections. This
+        # is the canonical structural defense for prompt injection.
         llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
-        design_prompt = (
-            f" You are an interior designer that works for Online Boutique. You are tasked with providing recommendations to a customer on what they should add to a given room from our catalog. This is the description of the room: \n"
-            f"{description_response} Here are a list of products that are relevant to it: {relevant_docs} Specifically, this is what the customer has asked for, see if you can accommodate it: {prompt} Start by repeating a brief description of the room's design to the customer, then provide your recommendations. Do your best to pick the most relevant item out of the list of products provided, but if none of them seem relevant, then say that instead of inventing a new product. At the end of the response, add a list of the IDs of the relevant products in the following format for the top 3 results: [<first product ID>], [<second product ID>], [<third product ID>] ")
-        print("Final design prompt: ")
-        print(design_prompt)
-        design_response = llm.invoke(
-            design_prompt
-        )
+        design_messages = [
+            SystemMessage(content=DESIGN_SYSTEM_PROMPT),
+            build_design_human_message(prompt, description_response, relevant_docs),
+        ]
+        print("Final design messages assembled")
+        design_response = llm.invoke(design_messages)
 
         data = {'content': design_response.content}
         return data
