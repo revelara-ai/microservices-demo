@@ -33,6 +33,7 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	gobreaker "github.com/sony/gobreaker/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -65,24 +66,31 @@ type ctxKeySessionID struct{}
 type frontendServer struct {
 	productCatalogSvcAddr string
 	productCatalogSvcConn *grpc.ClientConn
+	productCatalogCB      *gobreaker.CircuitBreaker[any]
 
 	currencySvcAddr string
 	currencySvcConn *grpc.ClientConn
+	currencyCB      *gobreaker.CircuitBreaker[any]
 
 	cartSvcAddr string
 	cartSvcConn *grpc.ClientConn
+	cartCB      *gobreaker.CircuitBreaker[any]
 
 	recommendationSvcAddr string
 	recommendationSvcConn *grpc.ClientConn
+	recommendationCB      *gobreaker.CircuitBreaker[any]
 
 	checkoutSvcAddr string
 	checkoutSvcConn *grpc.ClientConn
+	checkoutCB      *gobreaker.CircuitBreaker[any]
 
 	shippingSvcAddr string
 	shippingSvcConn *grpc.ClientConn
+	shippingCB      *gobreaker.CircuitBreaker[any]
 
 	adSvcAddr string
 	adSvcConn *grpc.ClientConn
+	adCB      *gobreaker.CircuitBreaker[any]
 
 	collectorAddr string
 	collectorConn *grpc.ClientConn
@@ -147,6 +155,18 @@ func main() {
 	mustConnGRPC(ctx, &svc.shippingSvcConn, svc.shippingSvcAddr)
 	mustConnGRPC(ctx, &svc.checkoutSvcConn, svc.checkoutSvcAddr)
 	mustConnGRPC(ctx, &svc.adSvcConn, svc.adSvcAddr)
+
+	// Circuit breakers gate every backend gRPC call so that a slow or unhealthy
+	// upstream fails fast instead of pinning frontend goroutines (R-001).
+	// Tunings mirror checkoutservice/main.go for consistency with the existing
+	// CB pattern; only transient gRPC errors trip the circuit.
+	svc.currencyCB = newCircuitBreaker(log, "currency-service", 5, 10*time.Second, 20*time.Second, 0.7, 5)
+	svc.productCatalogCB = newCircuitBreaker(log, "product-catalog-service", 5, 10*time.Second, 20*time.Second, 0.7, 5)
+	svc.cartCB = newCircuitBreaker(log, "cart-service", 5, 10*time.Second, 15*time.Second, 0.7, 5)
+	svc.recommendationCB = newCircuitBreaker(log, "recommendation-service", 5, 10*time.Second, 20*time.Second, 0.7, 5)
+	svc.shippingCB = newCircuitBreaker(log, "shipping-service", 3, 10*time.Second, 30*time.Second, 0.6, 5)
+	svc.checkoutCB = newCircuitBreaker(log, "checkout-service", 2, 10*time.Second, 30*time.Second, 0.5, 3)
+	svc.adCB = newCircuitBreaker(log, "ad-service", 2, 10*time.Second, 60*time.Second, 0.5, 3)
 
 	r := mux.NewRouter()
 	r.HandleFunc(baseUrl+"/", svc.homeHandler).Methods(http.MethodGet, http.MethodHead)

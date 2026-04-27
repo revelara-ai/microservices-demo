@@ -351,27 +351,37 @@ func (fe *frontendServer) placeOrderHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	order, err := pb.NewCheckoutServiceClient(fe.checkoutSvcConn).
-		PlaceOrder(r.Context(), &pb.PlaceOrderRequest{
-			Email: payload.Email,
-			CreditCard: &pb.CreditCardInfo{
-				CreditCardNumber:          payload.CcNumber,
-				CreditCardExpirationMonth: int32(payload.CcMonth),
-				CreditCardExpirationYear:  int32(payload.CcYear),
-				CreditCardCvv:             int32(payload.CcCVV)},
-			UserId:       sessionID(r),
-			UserCurrency: currentCurrency(r),
-			Address: &pb.Address{
-				StreetAddress: payload.StreetAddress,
-				City:          payload.City,
-				State:         payload.State,
-				ZipCode:       int32(payload.ZipCode),
-				Country:       payload.Country},
-		})
+	// PlaceOrder is the slowest synchronous call on the page (it fans out to
+	// shipping, payment, email, productcatalog, currency). 5s gives the
+	// orchestrator headroom under load while still bounding goroutine wait
+	// for the frontend HTTP handler. The checkoutCB fails fast under
+	// repeated transient errors (R-001).
+	placeOrderCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	orderResult, err := cbExecute(placeOrderCtx, fe.checkoutCB, func() (any, error) {
+		return pb.NewCheckoutServiceClient(fe.checkoutSvcConn).
+			PlaceOrder(placeOrderCtx, &pb.PlaceOrderRequest{
+				Email: payload.Email,
+				CreditCard: &pb.CreditCardInfo{
+					CreditCardNumber:          payload.CcNumber,
+					CreditCardExpirationMonth: int32(payload.CcMonth),
+					CreditCardExpirationYear:  int32(payload.CcYear),
+					CreditCardCvv:             int32(payload.CcCVV)},
+				UserId:       sessionID(r),
+				UserCurrency: currentCurrency(r),
+				Address: &pb.Address{
+					StreetAddress: payload.StreetAddress,
+					City:          payload.City,
+					State:         payload.State,
+					ZipCode:       int32(payload.ZipCode),
+					Country:       payload.Country},
+			})
+	})
 	if err != nil {
 		renderHTTPError(log, r, w, errors.Wrap(err, "failed to complete the order"), http.StatusInternalServerError)
 		return
 	}
+	order := orderResult.(*pb.PlaceOrderResponse)
 	log.WithField("order", order.GetOrder().GetOrderId()).Info("order placed")
 
 	order.GetOrder().GetItems()
