@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/profiler"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -37,6 +38,7 @@ import (
 
 const (
 	defaultPort = "50051"
+	metricsPort = "9090"
 )
 
 var log *logrus.Logger
@@ -77,18 +79,21 @@ func main() {
 	}
 	port = fmt.Sprintf(":%s", port)
 
+	registerMetrics(prometheus.DefaultRegisterer)
+	metricsSrv := startMetricsServer(log, ":"+metricsPort, prometheus.DefaultGatherer)
+
 	lis, err := net.Listen("tcp", port)
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
-	var srv *grpc.Server
+	srv := grpc.NewServer(
+		grpc.UnaryInterceptor(metricsUnaryInterceptor),
+	)
 	if os.Getenv("DISABLE_STATS") == "" {
-		log.Info("Stats enabled, but temporarily unavailable")
-		srv = grpc.NewServer()
+		log.Info("Stats enabled.")
 	} else {
 		log.Info("Stats disabled.")
-		srv = grpc.NewServer()
 	}
 	svc := &server{}
 	pb.RegisterShippingServiceServer(srv, svc)
@@ -136,6 +141,13 @@ func main() {
 	case <-shutdownCtx.Done():
 		log.Warn("graceful stop timed out, forcing shutdown")
 		srv.Stop()
+	}
+
+	// Drain metrics server so Prometheus can scrape final samples
+	if metricsSrv != nil {
+		if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+			log.Warnf("metrics server shutdown error: %v", err)
+		}
 	}
 
 	log.Info("shippingservice shutdown complete")
@@ -193,7 +205,8 @@ func (s *server) ShipOrder(ctx context.Context, in *pb.ShipOrderRequest) (*pb.Sh
 }
 
 func initStats() {
-	//TODO(arbrown) Implement OpenTelemetry stats
+	// Metrics initialization happens inline in main() via registerMetrics
+	// and startMetricsServer. This stub remains for backwards compatibility.
 }
 
 func initTracing() {

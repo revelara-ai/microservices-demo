@@ -45,6 +45,9 @@ spec:
         app: {{ .Values.frontend.name }}
       annotations:
         sidecar.istio.io/rewriteAppHTTPProbers: "true"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
     spec:
       {{- if .Values.serviceAccounts.create }}
       serviceAccountName: {{ .Values.frontend.name }}
@@ -74,6 +77,8 @@ spec:
           image: {{ .Values.images.repository }}/{{ .Values.frontend.name }}:{{ .Values.images.tag | default .Chart.AppVersion }}
           ports:
           - containerPort: 8080
+          - containerPort: 9090
+            name: metrics
           readinessProbe:
             initialDelaySeconds: 10
             httpGet:

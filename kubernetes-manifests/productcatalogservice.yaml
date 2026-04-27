@@ -27,6 +27,10 @@ spec:
     metadata:
       labels:
         app: productcatalogservice
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: productcatalogservice
       terminationGracePeriodSeconds: 5
@@ -47,6 +51,8 @@ spec:
         image: productcatalogservice
         ports:
         - containerPort: 3550
+        - containerPort: 9090
+          name: metrics
         env:
         - name: PORT
           value: "3550"
