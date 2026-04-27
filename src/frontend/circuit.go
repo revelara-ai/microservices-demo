@@ -50,6 +50,9 @@ func newCircuitBreaker(log logrus.FieldLogger, name string, maxRequests uint32, 
 				"from":    from.String(),
 				"to":      to.String(),
 			}).Warn("circuit breaker state changed")
+			// Emit a Prometheus counter alongside the log so SLO burn-rate
+			// alerts can fire on circuit open/close events (R-005).
+			circuitBreakerStateChanges.WithLabelValues(name, to.String()).Inc()
 		},
 	})
 }

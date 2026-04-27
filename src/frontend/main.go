@@ -33,6 +33,7 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"github.com/prometheus/client_golang/prometheus"
 	gobreaker "github.com/sony/gobreaker/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -40,6 +41,7 @@ import (
 
 const (
 	port            = "8080"
+	metricsPort     = "9090"
 	defaultCurrency = "USD"
 	cookieMaxAge    = 60 * 60 * 48
 
@@ -134,6 +136,12 @@ func main() {
 		log.Info("Profiling disabled.")
 	}
 
+	// Register Prometheus collectors and start the /metrics endpoint on a
+	// separate port from user traffic (R-005). The returned server is drained
+	// during graceful shutdown alongside the user-facing HTTP server.
+	registerMetrics(prometheus.DefaultRegisterer)
+	metricsSrv := startMetricsServer(log, ":"+metricsPort, prometheus.DefaultGatherer)
+
 	srvPort := port
 	if os.Getenv("PORT") != "" {
 		srvPort = os.Getenv("PORT")
@@ -169,6 +177,9 @@ func main() {
 	svc.adCB = newCircuitBreaker(log, "ad-service", 2, 10*time.Second, 60*time.Second, 0.5, 3)
 
 	r := mux.NewRouter()
+	// metricsMiddleware runs at the per-route level so mux.CurrentRoute is
+	// populated and routes can be labeled by template (low cardinality).
+	r.Use(metricsMiddleware)
 	r.HandleFunc(baseUrl+"/", svc.homeHandler).Methods(http.MethodGet, http.MethodHead)
 	r.HandleFunc(baseUrl+"/product/{id}", svc.productHandler).Methods(http.MethodGet, http.MethodHead)
 	r.HandleFunc(baseUrl+"/cart", svc.viewCartHandler).Methods(http.MethodGet, http.MethodHead)
@@ -225,6 +236,13 @@ func main() {
 		log.Info("HTTP server drained successfully")
 	}
 
+	// 1b. Drain metrics server.
+	if metricsSrv != nil {
+		if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+			log.Warnf("metrics server shutdown error: %v", err)
+		}
+	}
+
 	// 2. Close gRPC client connections
 	for name, conn := range map[string]*grpc.ClientConn{
 		"currency":        svc.currencySvcConn,
@@ -248,7 +266,10 @@ func main() {
 	log.Info("frontend shutdown complete")
 }
 func initStats(log logrus.FieldLogger) {
-	// TODO(arbrown) Implement OpenTelemtry stats
+	// Metrics initialization happens inline in main() via registerMetrics
+	// and startMetricsServer. This stub remains for backwards compatibility
+	// with anything that imports it.
+	_ = log
 }
 
 func initTracing(log logrus.FieldLogger, ctx context.Context, svc *frontendServer) (*sdktrace.TracerProvider, error) {

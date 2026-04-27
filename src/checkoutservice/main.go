@@ -26,6 +26,7 @@ import (
 	"cloud.google.com/go/profiler"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	gobreaker "github.com/sony/gobreaker/v2"
 	"google.golang.org/grpc"
@@ -49,6 +50,7 @@ import (
 
 const (
 	listenPort  = "5050"
+	metricsPort = "9090"
 	usdCurrency = "USD"
 )
 
@@ -142,6 +144,9 @@ func main() {
 
 	log.Infof("service config: %+v", svc)
 
+	registerMetrics(prometheus.DefaultRegisterer)
+	metricsSrv := startMetricsServer(log, ":"+metricsPort, prometheus.DefaultGatherer)
+
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		log.Fatal(err)
@@ -155,6 +160,7 @@ func main() {
 			propagation.TraceContext{}, propagation.Baggage{}))
 	srv = grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
+		grpc.UnaryInterceptor(metricsUnaryInterceptor),
 	)
 
 	pb.RegisterCheckoutServiceServer(srv, svc)
@@ -201,7 +207,14 @@ func main() {
 		srv.Stop()
 	}
 
-	// 2. Close gRPC client connections
+	// 2. Drain metrics server so Prometheus can scrape final samples
+	if metricsSrv != nil {
+		if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+			log.Warnf("metrics server shutdown error: %v", err)
+		}
+	}
+
+	// 3. Close gRPC client connections
 	for name, conn := range map[string]*grpc.ClientConn{
 		"shipping":        svc.shippingSvcConn,
 		"product-catalog": svc.productCatalogSvcConn,
@@ -219,7 +232,9 @@ func main() {
 }
 
 func initStats() {
-	//TODO(arbrown) Implement OpenTelemetry stats
+	// Metrics initialization happens inline in main() via registerMetrics
+	// and startMetricsServer. This stub remains for backwards compatibility
+	// with the original method signature.
 }
 
 func initTracing() {
@@ -309,6 +324,9 @@ func newCircuitBreaker(name string, maxRequests uint32, interval, timeout time.D
 				"from":    from.String(),
 				"to":      to.String(),
 			}).Warn("circuit breaker state changed")
+			// Emit a Prometheus counter alongside the log so SLO burn-rate
+			// alerts can fire on circuit open/close events (R-005).
+			circuitBreakerStateChanges.WithLabelValues(name, to.String()).Inc()
 		},
 	})
 }

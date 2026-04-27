@@ -32,6 +32,7 @@ import (
 
 	"cloud.google.com/go/profiler"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
@@ -46,7 +47,8 @@ var (
 	log          *logrus.Logger
 	extraLatency time.Duration
 
-	port = "3550"
+	port        = "3550"
+	metricsPort = "9090"
 
 	reloadCatalog bool
 )
@@ -115,6 +117,10 @@ func main() {
 	if os.Getenv("PORT") != "" {
 		port = os.Getenv("PORT")
 	}
+
+	registerMetrics(prometheus.DefaultRegisterer)
+	startMetricsServer(log, ":"+metricsPort, prometheus.DefaultGatherer)
+
 	log.Infof("starting grpc server at :%s", port)
 	run(port)
 	select {}
@@ -132,7 +138,9 @@ func run(port string) string {
 			propagation.TraceContext{}, propagation.Baggage{}))
 	var srv *grpc.Server
 	srv = grpc.NewServer(
-		grpc.StatsHandler(otelgrpc.NewServerHandler()))
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
+		grpc.UnaryInterceptor(metricsUnaryInterceptor),
+	)
 
 	svc := &productCatalog{}
 	err = loadCatalog(&svc.catalog)
@@ -149,7 +157,8 @@ func run(port string) string {
 }
 
 func initStats() {
-	// TODO(drewbr) Implement OpenTelemetry stats
+	// Metrics initialization happens inline in main() via registerMetrics
+	// and startMetricsServer. This stub remains for backwards compatibility.
 }
 
 func initTracing() error {

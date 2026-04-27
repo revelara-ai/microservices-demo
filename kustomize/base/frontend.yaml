@@ -29,6 +29,9 @@ spec:
         app: frontend
       annotations:
         sidecar.istio.io/rewriteAppHTTPProbers: "true"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: frontend
       securityContext:
@@ -48,6 +51,8 @@ spec:
           image: us-central1-docker.pkg.dev/google-samples/microservices-demo/frontend:v0.10.5
           ports:
           - containerPort: 8080
+          - containerPort: 9090
+            name: metrics
           readinessProbe:
             initialDelaySeconds: 10
             httpGet:

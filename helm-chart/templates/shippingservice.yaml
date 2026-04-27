@@ -43,6 +43,10 @@ spec:
     metadata:
       labels:
         app: {{ .Values.shippingService.name }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
     spec:
       {{- if .Values.serviceAccounts.create }}
       serviceAccountName: {{ .Values.shippingService.name }}
@@ -72,6 +76,8 @@ spec:
         image: {{ .Values.images.repository }}/{{ .Values.shippingService.name }}:{{ .Values.images.tag | default .Chart.AppVersion }}
         ports:
         - containerPort: 50051
+        - containerPort: 9090
+          name: metrics
         env:
         - name: PORT
           value: "50051"
