@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rvl knowledge:*)",
+      "Bash(rvl control:*)",
+      "Bash(rvl risk:*)",
+      "Bash(rvl knowledge graph-search*)",
+      "Bash(rvl knowledge foresight*)",
+      "Bash(rvl knowledge enrich*)",
+      "Bash(rvl knowledge search*)",
+      "Bash(rvl risk context*)",
+      "Bash(rvl risk show*)",
+      "Bash(rvl risk list*)",
+      "Bash(rvl risk ready*)",
+      "Bash(rvl control show*)",
+      "Bash(rvl control list*)",
+      "Bash(cat .revelara/memory/*)",
+      "Bash(cat .revelara/*.yaml)",
+      "Bash(kubectl get *)",
+      "Bash(kubectl describe *)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(rm -rf /tmp/scan-parts)",
+      "Bash(mkdir -p /tmp/scan-parts)",
+      "Bash([ -f \"$TARGET/src/frontend/go.mod\" ])",
+      "Bash([ -f \"$TARGET/src/shippingservice/go.mod\" ])"
+    ]
+  }
+}
