@@ -19,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -119,14 +120,60 @@ func main() {
 	}
 
 	registerMetrics(prometheus.DefaultRegisterer)
-	startMetricsServer(log, ":"+metricsPort, prometheus.DefaultGatherer)
+	metricsSrv := startMetricsServer(log, ":"+metricsPort, prometheus.DefaultGatherer)
 
 	log.Infof("starting grpc server at :%s", port)
-	run(port)
-	select {}
+	srv, healthcheck := run(port)
+
+	// Wait for a shutdown signal. Kubernetes sends SIGTERM during rolling
+	// deploys and pod eviction; without this the process is killed at the OS
+	// level after terminationGracePeriodSeconds, dropping in-flight gRPC
+	// requests (e.g. product lookups from checkoutservice and frontend).
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	sig := <-stop
+	log.Infof("received signal %v, starting graceful shutdown", sig)
+
+	gracefulShutdown(srv, healthcheck, metricsSrv)
 }
 
-func run(port string) string {
+// gracefulShutdown drains the gRPC server so in-flight RPCs complete before the
+// process exits, and flips the health status to NOT_SERVING so readiness probes
+// pull the pod from rotation immediately. The 25s budget fits within the K8s
+// default 30s terminationGracePeriodSeconds. Mirrors checkoutservice.
+func gracefulShutdown(srv *grpc.Server, healthcheck *health.Server, metricsSrv *http.Server) {
+	// Fail readiness fast so the load balancer stops sending new traffic.
+	healthcheck.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	// Drain the gRPC server: stop accepting new RPCs, finish in-flight ones.
+	stopped := make(chan struct{})
+	go func() {
+		srv.GracefulStop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+		log.Info("gRPC server drained successfully")
+	case <-shutdownCtx.Done():
+		log.Warn("graceful stop timed out, forcing shutdown")
+		srv.Stop()
+	}
+
+	// Drain the metrics server so Prometheus can scrape final samples.
+	if metricsSrv != nil {
+		if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+			log.Warnf("metrics server shutdown error: %v", err)
+		}
+	}
+
+	log.Info("productcatalogservice shutdown complete")
+}
+
+func run(port string) (*grpc.Server, *health.Server) {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		log.Fatal(err)
@@ -153,7 +200,8 @@ func run(port string) string {
 	healthpb.RegisterHealthServer(srv, healthcheck)
 	go srv.Serve(listener)
 
-	return listener.Addr().String()
+	log.Infof("product catalog gRPC server listening on %s", listener.Addr().String())
+	return srv, healthcheck
 }
 
 func initStats() {
