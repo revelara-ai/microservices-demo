@@ -27,6 +27,23 @@ const logger = pino({
 });
 
 
+// Idempotency window for duplicate-charge suppression (R-026). A repeated
+// Charge carrying the same idempotency_key inside this window returns the
+// original transaction instead of charging the card again. The cache is
+// in-memory because this service simulates the processor; a real integration
+// would use the processor's idempotency support or a shared store.
+const IDEMPOTENCY_TTL_MS = 10 * 60 * 1000;
+const recentTransactions = new Map();
+
+function sweepExpiredTransactions () {
+  const now = Date.now();
+  for (const [key, entry] of recentTransactions) {
+    if (now - entry.timestamp > IDEMPOTENCY_TTL_MS) {
+      recentTransactions.delete(key);
+    }
+  }
+}
+
 class CreditCardError extends Error {
   constructor (message) {
     super(message);
@@ -59,7 +76,17 @@ class ExpiredCreditCard extends CreditCardError {
  * @return transaction_id - a random uuid.
  */
 module.exports = function charge (request) {
-  const { amount, credit_card: creditCard } = request;
+  const { amount, credit_card: creditCard, idempotency_key: idempotencyKey } = request;
+
+  if (idempotencyKey) {
+    sweepExpiredTransactions();
+    const prior = recentTransactions.get(idempotencyKey);
+    if (prior) {
+      logger.info(`Duplicate charge suppressed for idempotency key ${idempotencyKey}; returning original transaction ${prior.transactionId}`);
+      return { transaction_id: prior.transactionId };
+    }
+  }
+
   const cardNumber = creditCard.credit_card_number;
   const cardInfo = cardValidator(cardNumber);
   const {
@@ -82,5 +109,13 @@ module.exports = function charge (request) {
   logger.info(`Transaction processed: ${cardType} ending ${cardNumber.substr(-4)} \
     Amount: ${amount.currency_code}${amount.units}.${amount.nanos}`);
 
-  return { transaction_id: uuidv4() };
+  const transactionId = uuidv4();
+  if (idempotencyKey) {
+    recentTransactions.set(idempotencyKey, { transactionId, timestamp: Date.now() });
+  }
+  return { transaction_id: transactionId };
 };
+
+// Exposed for tests only.
+module.exports._recentTransactions = recentTransactions;
+module.exports._idempotencyTtlMs = IDEMPOTENCY_TTL_MS;

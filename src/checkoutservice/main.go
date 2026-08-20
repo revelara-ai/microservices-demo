@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/profiler"
@@ -237,7 +239,7 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 
 	prep, err := cs.prepareOrderItemsAndShippingQuoteFromCart(ctx, req.UserId, req.UserCurrency, req.Address)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, err.Error())
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	total := pb.Money{CurrencyCode: req.UserCurrency,
@@ -249,7 +251,8 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 		total = money.Must(money.Sum(total, multPrice))
 	}
 
-	txID, err := cs.chargeCard(ctx, &total, req.CreditCard)
+	idempotencyKey := chargeIdempotencyKey(req.UserId, prep.cartItems, &total)
+	txID, err := cs.chargeCard(ctx, &total, req.CreditCard, idempotencyKey)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to charge card: %+v", err)
 	}
@@ -257,6 +260,21 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 
 	shippingTrackingID, err := cs.shipOrder(ctx, req.Address, prep.cartItems)
 	if err != nil {
+		log.Warnf("shipping failed, retrying once: %+v", err)
+		shippingTrackingID, err = cs.shipOrder(ctx, req.Address, prep.cartItems)
+	}
+	if err != nil {
+		// The card was already charged and the simulated payment processor has
+		// no refund RPC, so emit a compensation event for alerting and return a
+		// retryable error. The retry is charge-safe: the same session retrying
+		// the same cart derives the same idempotency key, which the payment
+		// service deduplicates.
+		log.WithFields(logrus.Fields{
+			"event":          "compensation_required",
+			"order_id":       orderID.String(),
+			"transaction_id": txID,
+			"amount":         fmt.Sprintf("%s %d.%09d", total.GetCurrencyCode(), total.GetUnits(), total.GetNanos()),
+		}).Error("order charged but shipping failed; manual compensation required")
 		return nil, status.Errorf(codes.Unavailable, "shipping error: %+v", err)
 	}
 
@@ -366,10 +384,27 @@ func (cs *checkoutService) convertCurrency(ctx context.Context, from *pb.Money, 
 	return result, err
 }
 
-func (cs *checkoutService) chargeCard(ctx context.Context, amount *pb.Money, paymentInfo *pb.CreditCardInfo) (string, error) {
+// chargeIdempotencyKey derives a stable key for one checkout attempt: the same
+// session retrying the same cart at the same total maps to the same key, so the
+// payment service can suppress duplicate charges after a post-charge failure.
+// The cart is only emptied after a successful order, so a genuinely new order
+// cannot collide with a retry inside the payment service's dedup window.
+func chargeIdempotencyKey(userID string, items []*pb.CartItem, total *pb.Money) string {
+	parts := make([]string, 0, len(items))
+	for _, it := range items {
+		parts = append(parts, fmt.Sprintf("%s:%d", it.GetProductId(), it.GetQuantity()))
+	}
+	sort.Strings(parts)
+	seed := fmt.Sprintf("%s|%s|%s%d.%d", userID, strings.Join(parts, ","),
+		total.GetCurrencyCode(), total.GetUnits(), total.GetNanos())
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(seed)).String()
+}
+
+func (cs *checkoutService) chargeCard(ctx context.Context, amount *pb.Money, paymentInfo *pb.CreditCardInfo, idempotencyKey string) (string, error) {
 	paymentResp, err := pb.NewPaymentServiceClient(cs.paymentSvcConn).Charge(ctx, &pb.ChargeRequest{
-		Amount:     amount,
-		CreditCard: paymentInfo})
+		Amount:         amount,
+		CreditCard:     paymentInfo,
+		IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return "", fmt.Errorf("could not charge the card: %+v", err)
 	}

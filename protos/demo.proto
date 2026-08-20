@@ -188,6 +188,10 @@ message CreditCardInfo {
 message ChargeRequest {
     Money amount = 1;
     CreditCardInfo credit_card = 2;
+    // Idempotency key: repeated Charge calls carrying the same key within the
+    // payment service's dedup window return the original transaction instead
+    // of charging again.
+    string idempotency_key = 3;
 }
 
 message ChargeResponse {
