@@ -58,6 +58,15 @@ const (
 	paymentRPCTimeout  = 10 * time.Second
 	emailRPCTimeout    = 5 * time.Second
 
+	// Reversing a charge is the compensating transaction for a checkout that
+	// failed after the card was charged. It runs on a context detached from the
+	// request, so it needs its own budget and a bounded retry: the customer's
+	// money is already gone and a single dropped packet must not be what
+	// decides whether they get it back (RC-018, RC-066).
+	refundRPCTimeout = 10 * time.Second
+	refundAttempts   = 3
+	refundRetryDelay = 500 * time.Millisecond
+
 	// Time allowed to finish in-flight orders after SIGTERM. Kubernetes sends
 	// SIGTERM on pod termination; a bare Serve() dies at once and severs
 	// in-flight checkouts on every rollout (RC-018, RC-060).
@@ -281,7 +290,7 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 
 	prep, err := cs.prepareOrderItemsAndShippingQuoteFromCart(ctx, req.UserId, req.UserCurrency, req.Address)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, err.Error())
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	total := pb.Money{CurrencyCode: req.UserCurrency,
@@ -301,13 +310,13 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 
 	shippingTrackingID, err := cs.shipOrder(ctx, req.Address, prep.cartItems)
 	if err != nil {
-		// The card is already charged and paymentservice exposes no reversal
-		// RPC (see protos/demo.proto: PaymentService has only Charge), so no
-		// compensating transaction is possible here yet. Emit a structured
-		// reconciliation record so the orphaned charge is recoverable by hand
-		// and visible in Cloud Logging instead of being lost (RC-066).
-		log.WithFields(logrus.Fields{
-			"event":          "orphaned_charge",
+		// The card is already charged, so the saga has to be unwound rather
+		// than simply abandoned: reverse the charge (RC-018). If the reversal
+		// itself fails we still owe the customer their money, so fall back to
+		// the structured reconciliation record that makes the orphaned charge
+		// recoverable by hand from Cloud Logging (RC-066).
+		refundID, refundErr := cs.refundCharge(ctx, txID, &total, err.Error())
+		fields := logrus.Fields{
 			"order_id":       orderID.String(),
 			"transaction_id": txID,
 			"user_id":        req.UserId,
@@ -315,7 +324,16 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 			"amount_nanos":   total.GetNanos(),
 			"currency_code":  total.GetCurrencyCode(),
 			"reason":         err.Error(),
-		}).Error("charge succeeded but shipment failed; manual reconciliation required")
+		}
+		if refundErr != nil {
+			fields["event"] = "orphaned_charge"
+			fields["refund_error"] = refundErr.Error()
+			log.WithFields(fields).Error("charge succeeded, shipment failed and the reversal failed; manual reconciliation required")
+		} else {
+			fields["event"] = "charge_reversed"
+			fields["refund_id"] = refundID
+			log.WithFields(fields).Warn("charge succeeded but shipment failed; charge reversed")
+		}
 		return nil, status.Errorf(codes.Unavailable, "shipping error: %+v", err)
 	}
 
@@ -450,6 +468,47 @@ func (cs *checkoutService) chargeCard(ctx context.Context, amount *pb.Money, pay
 		return "", fmt.Errorf("could not charge the card: %+v", err)
 	}
 	return paymentResp.GetTransactionId(), nil
+}
+
+// refundCharge reverses a completed charge. It deliberately does not inherit
+// cancellation from the caller: PlaceOrder reaches this path because something
+// already went wrong, and the request context is routinely cancelled or past
+// its deadline by then. A compensating transaction that dies with the request
+// that triggered it is not a compensating transaction. context.WithoutCancel
+// keeps the trace and log correlation values while dropping the cancellation.
+//
+// Refund is idempotent on the transaction id, so retrying it cannot refund the
+// same charge twice.
+func (cs *checkoutService) refundCharge(ctx context.Context, txID string, amount *pb.Money, reason string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refundRPCTimeout)
+	defer cancel()
+
+	client := pb.NewPaymentServiceClient(cs.paymentSvcConn)
+	req := &pb.RefundRequest{
+		TransactionId: txID,
+		Amount:        amount,
+		Reason:        reason,
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= refundAttempts; attempt++ {
+		resp, err := client.Refund(ctx, req)
+		if err == nil {
+			return resp.GetRefundId(), nil
+		}
+		lastErr = err
+		log.Warnf("refund attempt %d/%d for transaction %s failed: %+v", attempt, refundAttempts, txID, err)
+
+		if attempt == refundAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("could not reverse the charge: %+v (refund budget exhausted after %d attempts)", lastErr, attempt)
+		case <-time.After(refundRetryDelay):
+		}
+	}
+	return "", fmt.Errorf("could not reverse the charge after %d attempts: %+v", refundAttempts, lastErr)
 }
 
 func (cs *checkoutService) sendOrderConfirmation(ctx context.Context, email string, order *pb.OrderResult) error {

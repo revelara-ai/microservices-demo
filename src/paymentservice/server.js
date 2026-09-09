@@ -17,6 +17,7 @@ const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
 
 const charge = require('./charge');
+const refund = require('./refund');
 
 const logger = require('./logger')
 
@@ -42,6 +43,22 @@ class HipsterShopServer {
     try {
       logger.info(`PaymentService#Charge invoked with request ${JSON.stringify(call.request)}`);
       const response = charge(call.request);
+      callback(null, response);
+    } catch (err) {
+      console.warn(err);
+      callback(err);
+    }
+  }
+
+  /**
+   * Handler for PaymentService.Refund.
+   * @param {*} call  { RefundRequest }
+   * @param {*} callback  fn(err, RefundResponse)
+   */
+  static RefundServiceHandler(call, callback) {
+    try {
+      logger.info(`PaymentService#Refund invoked for transaction ${call.request.transaction_id}`);
+      const response = refund(call.request);
       callback(null, response);
     } catch (err) {
       console.warn(err);
@@ -88,7 +105,8 @@ class HipsterShopServer {
     this.server.addService(
       hipsterShopPackage.PaymentService.service,
       {
-        charge: HipsterShopServer.ChargeServiceHandler.bind(this)
+        charge: HipsterShopServer.ChargeServiceHandler.bind(this),
+        refund: HipsterShopServer.RefundServiceHandler.bind(this)
       }
     );
 
