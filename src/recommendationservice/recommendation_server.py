@@ -16,6 +16,8 @@
 
 import os
 import random
+import signal
+import threading
 import time
 import traceback
 from concurrent import futures
@@ -66,11 +68,29 @@ def initStackdriverProfiling():
   #       logger.warning("Could not initialize Stackdriver Profiler after retrying, giving up")
   return
 
+# Bound every outbound call. gRPC applies no default deadline, so a slow or
+# unreachable productcatalogservice blocks a worker thread forever against the
+# fixed 10-worker pool below, and the pool exhausts (RC-019, RC-067).
+CATALOG_RPC_TIMEOUT_SECONDS = float(os.environ.get("CATALOG_RPC_TIMEOUT_SECONDS", "3"))
+
+# Time allowed to drain in-flight RPCs after SIGTERM (RC-018, RC-060).
+SHUTDOWN_GRACE_SECONDS = float(os.environ.get("SHUTDOWN_GRACE_SECONDS", "20"))
+
+
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
         max_responses = 5
         # fetch list of products from product catalog stub
-        cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
+        try:
+            cat_response = product_catalog_stub.ListProducts(
+                demo_pb2.Empty(), timeout=CATALOG_RPC_TIMEOUT_SECONDS)
+        except grpc.RpcError as err:
+            # Degrade instead of hanging: recommendations are optional, and a
+            # held worker thread is what turns a slow catalog into an outage.
+            logger.warning(
+                "product catalog unavailable ({}), returning no recommendations".format(
+                    err.code()))
+            return demo_pb2.ListRecommendationsResponse()
         product_ids = [x.id for x in cat_response.products]
         filtered_products = list(set(product_ids)-set(request.product_ids))
         num_products = len(filtered_products)
@@ -149,8 +169,21 @@ if __name__ == "__main__":
     server.start()
 
     # keep alive
+    # Python raises KeyboardInterrupt only for SIGINT. Kubernetes sends SIGTERM
+    # on pod termination, and the default SIGTERM handler kills the interpreter
+    # without draining in-flight RPCs (RC-018, RC-060).
+    stop_requested = threading.Event()
+
+    def _handle_sigterm(signum, _frame):
+        logger.info("received signal {}, draining in-flight requests".format(signum))
+        stop_requested.set()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     try:
-         while True:
-            time.sleep(10000)
+        stop_requested.wait()
     except KeyboardInterrupt:
-            server.stop(0)
+        logger.info("received SIGINT, draining in-flight requests")
+
+    server.stop(SHUTDOWN_GRACE_SECONDS).wait(SHUTDOWN_GRACE_SECONDS)
+    logger.info("shutdown complete")

@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"cloud.google.com/go/profiler"
@@ -45,6 +47,30 @@ import (
 const (
 	listenPort  = "5050"
 	usdCurrency = "USD"
+
+	// Per-RPC deadlines. grpc.NewClient takes no context, so a client-level
+	// timeout is impossible; every downstream call must carry its own deadline
+	// or it waits forever on a slow dependency (RC-019).
+	cartRPCTimeout     = 3 * time.Second
+	catalogRPCTimeout  = 3 * time.Second
+	currencyRPCTimeout = 3 * time.Second
+	shippingRPCTimeout = 5 * time.Second
+	paymentRPCTimeout  = 10 * time.Second
+	emailRPCTimeout    = 5 * time.Second
+
+	// Reversing a charge is the compensating transaction for a checkout that
+	// failed after the card was charged. It runs on a context detached from the
+	// request, so it needs its own budget and a bounded retry: the customer's
+	// money is already gone and a single dropped packet must not be what
+	// decides whether they get it back (RC-018, RC-066).
+	refundRPCTimeout = 10 * time.Second
+	refundAttempts   = 3
+	refundRetryDelay = 500 * time.Millisecond
+
+	// Time allowed to finish in-flight orders after SIGTERM. Kubernetes sends
+	// SIGTERM on pod termination; a bare Serve() dies at once and severs
+	// in-flight checkouts on every rollout (RC-018, RC-060).
+	shutdownGracePeriod = 20 * time.Second
 )
 
 var log *logrus.Logger
@@ -142,9 +168,35 @@ func main() {
 	pb.RegisterCheckoutServiceServer(srv, svc)
 	healthcheck := health.NewServer()
 	healthpb.RegisterHealthServer(srv, healthcheck)
-	log.Infof("starting to listen on tcp: %q", lis.Addr().String())
-	err = srv.Serve(lis)
-	log.Fatal(err)
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	serveErr := make(chan error, 1)
+	go func() {
+		log.Infof("starting to listen on tcp: %q", lis.Addr().String())
+		serveErr <- srv.Serve(lis)
+	}()
+
+	select {
+	case err := <-serveErr:
+		log.Fatal(err)
+	case <-shutdownCtx.Done():
+		stop() // restore default signal handling, so a second signal aborts
+		log.Info("shutdown signal received, draining in-flight orders")
+		healthcheck.Shutdown() // fail readiness before we stop accepting work
+		drained := make(chan struct{})
+		go func() {
+			srv.GracefulStop()
+			close(drained)
+		}()
+		select {
+		case <-drained:
+			log.Info("shutdown complete")
+		case <-time.After(shutdownGracePeriod):
+			log.Warn("graceful shutdown timed out, forcing stop")
+			srv.Stop()
+		}
+	}
 }
 
 func initStats() {
@@ -207,10 +259,11 @@ func mustMapEnv(target *string, envKey string) {
 	*target = v
 }
 
-func mustConnGRPC(ctx context.Context, conn **grpc.ClientConn, addr string) {
+// mustConnGRPC establishes a lazily-connecting client. grpc.NewClient takes no
+// context, so no timeout belongs here; per-RPC deadlines are set at the call
+// sites instead (RC-019).
+func mustConnGRPC(_ context.Context, conn **grpc.ClientConn, addr string) {
 	var err error
-	_, cancel := context.WithTimeout(ctx, time.Second*3)
-	defer cancel()
 	*conn, err = grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
@@ -237,7 +290,7 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 
 	prep, err := cs.prepareOrderItemsAndShippingQuoteFromCart(ctx, req.UserId, req.UserCurrency, req.Address)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, err.Error())
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	total := pb.Money{CurrencyCode: req.UserCurrency,
@@ -257,6 +310,30 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 
 	shippingTrackingID, err := cs.shipOrder(ctx, req.Address, prep.cartItems)
 	if err != nil {
+		// The card is already charged, so the saga has to be unwound rather
+		// than simply abandoned: reverse the charge (RC-018). If the reversal
+		// itself fails we still owe the customer their money, so fall back to
+		// the structured reconciliation record that makes the orphaned charge
+		// recoverable by hand from Cloud Logging (RC-066).
+		refundID, refundErr := cs.refundCharge(ctx, txID, &total, err.Error())
+		fields := logrus.Fields{
+			"order_id":       orderID.String(),
+			"transaction_id": txID,
+			"user_id":        req.UserId,
+			"amount_units":   total.GetUnits(),
+			"amount_nanos":   total.GetNanos(),
+			"currency_code":  total.GetCurrencyCode(),
+			"reason":         err.Error(),
+		}
+		if refundErr != nil {
+			fields["event"] = "orphaned_charge"
+			fields["refund_error"] = refundErr.Error()
+			log.WithFields(fields).Error("charge succeeded, shipment failed and the reversal failed; manual reconciliation required")
+		} else {
+			fields["event"] = "charge_reversed"
+			fields["refund_id"] = refundID
+			log.WithFields(fields).Warn("charge succeeded but shipment failed; charge reversed")
+		}
 		return nil, status.Errorf(codes.Unavailable, "shipping error: %+v", err)
 	}
 
@@ -311,6 +388,8 @@ func (cs *checkoutService) prepareOrderItemsAndShippingQuoteFromCart(ctx context
 }
 
 func (cs *checkoutService) quoteShipping(ctx context.Context, address *pb.Address, items []*pb.CartItem) (*pb.Money, error) {
+	ctx, cancel := context.WithTimeout(ctx, shippingRPCTimeout)
+	defer cancel()
 	shippingQuote, err := pb.NewShippingServiceClient(cs.shippingSvcConn).
 		GetQuote(ctx, &pb.GetQuoteRequest{
 			Address: address,
@@ -322,6 +401,8 @@ func (cs *checkoutService) quoteShipping(ctx context.Context, address *pb.Addres
 }
 
 func (cs *checkoutService) getUserCart(ctx context.Context, userID string) ([]*pb.CartItem, error) {
+	ctx, cancel := context.WithTimeout(ctx, cartRPCTimeout)
+	defer cancel()
 	cart, err := pb.NewCartServiceClient(cs.cartSvcConn).GetCart(ctx, &pb.GetCartRequest{UserId: userID})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user cart during checkout: %+v", err)
@@ -330,6 +411,8 @@ func (cs *checkoutService) getUserCart(ctx context.Context, userID string) ([]*p
 }
 
 func (cs *checkoutService) emptyUserCart(ctx context.Context, userID string) error {
+	ctx, cancel := context.WithTimeout(ctx, cartRPCTimeout)
+	defer cancel()
 	if _, err := pb.NewCartServiceClient(cs.cartSvcConn).EmptyCart(ctx, &pb.EmptyCartRequest{UserId: userID}); err != nil {
 		return fmt.Errorf("failed to empty user cart during checkout: %+v", err)
 	}
@@ -341,7 +424,11 @@ func (cs *checkoutService) prepOrderItems(ctx context.Context, items []*pb.CartI
 	cl := pb.NewProductCatalogServiceClient(cs.productCatalogSvcConn)
 
 	for i, item := range items {
-		product, err := cl.GetProduct(ctx, &pb.GetProductRequest{Id: item.GetProductId()})
+		product, err := func() (*pb.Product, error) {
+			ctx, cancel := context.WithTimeout(ctx, catalogRPCTimeout)
+			defer cancel()
+			return cl.GetProduct(ctx, &pb.GetProductRequest{Id: item.GetProductId()})
+		}()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get product #%q", item.GetProductId())
 		}
@@ -357,7 +444,12 @@ func (cs *checkoutService) prepOrderItems(ctx context.Context, items []*pb.CartI
 }
 
 func (cs *checkoutService) convertCurrency(ctx context.Context, from *pb.Money, toCurrency string) (*pb.Money, error) {
-	result, err := pb.NewCurrencyServiceClient(cs.currencySvcConn).Convert(context.TODO(), &pb.CurrencyConversionRequest{
+	// Use the caller's ctx, not context.TODO(). This runs once per cart line
+	// item plus once for shipping, so a detached call here is the single
+	// largest source of deadline-free work in a checkout (RC-019, RC-046).
+	ctx, cancel := context.WithTimeout(ctx, currencyRPCTimeout)
+	defer cancel()
+	result, err := pb.NewCurrencyServiceClient(cs.currencySvcConn).Convert(ctx, &pb.CurrencyConversionRequest{
 		From:   from,
 		ToCode: toCurrency})
 	if err != nil {
@@ -367,6 +459,8 @@ func (cs *checkoutService) convertCurrency(ctx context.Context, from *pb.Money, 
 }
 
 func (cs *checkoutService) chargeCard(ctx context.Context, amount *pb.Money, paymentInfo *pb.CreditCardInfo) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, paymentRPCTimeout)
+	defer cancel()
 	paymentResp, err := pb.NewPaymentServiceClient(cs.paymentSvcConn).Charge(ctx, &pb.ChargeRequest{
 		Amount:     amount,
 		CreditCard: paymentInfo})
@@ -376,7 +470,50 @@ func (cs *checkoutService) chargeCard(ctx context.Context, amount *pb.Money, pay
 	return paymentResp.GetTransactionId(), nil
 }
 
+// refundCharge reverses a completed charge. It deliberately does not inherit
+// cancellation from the caller: PlaceOrder reaches this path because something
+// already went wrong, and the request context is routinely cancelled or past
+// its deadline by then. A compensating transaction that dies with the request
+// that triggered it is not a compensating transaction. context.WithoutCancel
+// keeps the trace and log correlation values while dropping the cancellation.
+//
+// Refund is idempotent on the transaction id, so retrying it cannot refund the
+// same charge twice.
+func (cs *checkoutService) refundCharge(ctx context.Context, txID string, amount *pb.Money, reason string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refundRPCTimeout)
+	defer cancel()
+
+	client := pb.NewPaymentServiceClient(cs.paymentSvcConn)
+	req := &pb.RefundRequest{
+		TransactionId: txID,
+		Amount:        amount,
+		Reason:        reason,
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= refundAttempts; attempt++ {
+		resp, err := client.Refund(ctx, req)
+		if err == nil {
+			return resp.GetRefundId(), nil
+		}
+		lastErr = err
+		log.Warnf("refund attempt %d/%d for transaction %s failed: %+v", attempt, refundAttempts, txID, err)
+
+		if attempt == refundAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("could not reverse the charge: %+v (refund budget exhausted after %d attempts)", lastErr, attempt)
+		case <-time.After(refundRetryDelay):
+		}
+	}
+	return "", fmt.Errorf("could not reverse the charge after %d attempts: %+v", refundAttempts, lastErr)
+}
+
 func (cs *checkoutService) sendOrderConfirmation(ctx context.Context, email string, order *pb.OrderResult) error {
+	ctx, cancel := context.WithTimeout(ctx, emailRPCTimeout)
+	defer cancel()
 	_, err := pb.NewEmailServiceClient(cs.emailSvcConn).SendOrderConfirmation(ctx, &pb.SendOrderConfirmationRequest{
 		Email: email,
 		Order: order})
@@ -384,6 +521,8 @@ func (cs *checkoutService) sendOrderConfirmation(ctx context.Context, email stri
 }
 
 func (cs *checkoutService) shipOrder(ctx context.Context, address *pb.Address, items []*pb.CartItem) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, shippingRPCTimeout)
+	defer cancel()
 	resp, err := pb.NewShippingServiceClient(cs.shippingSvcConn).ShipOrder(ctx, &pb.ShipOrderRequest{
 		Address: address,
 		Items:   items})
