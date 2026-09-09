@@ -13,6 +13,7 @@
 // limitations under the License.
 
 using System;
+using System.Linq;
 using System.Threading.Tasks;
 using Grpc.Net.Client;
 using Hipstershop;
@@ -155,6 +156,47 @@ namespace cartservice.tests
             await client.EmptyCartAsync(new EmptyCartRequest { UserId = userId });
             cart = await client.GetCartAsync(getCartRequest);
             Assert.Empty(cart.Items);
+        }
+
+        [Fact]
+        public async Task AddItem_Concurrent_NoLostUpdates()
+        {
+            // Regression test for R-023: AddItem used to read the cart, mutate it
+            // in process memory and write the whole cart back. Concurrent calls
+            // for the same user both read the same pre-state, so the second write
+            // silently discarded the first and quantities were lost.
+            using var server = await _host.StartAsync();
+            var httpClient = server.GetTestClient();
+
+            string userId = Guid.NewGuid().ToString();
+
+            var channel = GrpcChannel.ForAddress(httpClient.BaseAddress, new GrpcChannelOptions
+            {
+                HttpClient = httpClient
+            });
+
+            var client = new CartServiceClient(channel);
+
+            const int concurrentAdds = 20;
+            var request = new AddItemRequest
+            {
+                UserId = userId,
+                Item = new CartItem
+                {
+                    ProductId = "1",
+                    Quantity = 1
+                }
+            };
+
+            await Task.WhenAll(Enumerable.Range(0, concurrentAdds)
+                .Select(_ => client.AddItemAsync(request).ResponseAsync));
+
+            var cart = await client.GetCartAsync(new GetCartRequest { UserId = userId });
+            Assert.Single(cart.Items);
+            Assert.Equal(concurrentAdds, cart.Items[0].Quantity);
+
+            // Cleanup
+            await client.EmptyCartAsync(new EmptyCartRequest { UserId = userId });
         }
     }
 }
