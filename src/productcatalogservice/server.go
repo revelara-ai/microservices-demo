@@ -41,10 +41,21 @@ import (
 	"google.golang.org/grpc"
 )
 
+const (
+	// Upper bound for the injected EXTRA_LATENCY demo delay.
+	maxExtraLatency = 5 * time.Second
+
+	// Time allowed to drain in-flight catalog RPCs after SIGTERM
+	// (RC-018, RC-060).
+	shutdownGracePeriod = 20 * time.Second
+)
+
 var (
-	catalogMutex *sync.Mutex
-	log          *logrus.Logger
-	extraLatency time.Duration
+	catalogMutex  *sync.Mutex
+	log           *logrus.Logger
+	extraLatency  time.Duration
+	runningSrv    *grpc.Server
+	runningHealth *health.Server
 
 	port = "3550"
 
@@ -90,6 +101,16 @@ func main() {
 		if err != nil {
 			log.Fatalf("failed to parse EXTRA_LATENCY (%s) as time.Duration: %+v", v, err)
 		}
+		// Cap the demo delay. ParseDuration accepts any magnitude, so a value
+		// left over from a load test could otherwise stall every catalog RPC
+		// indefinitely (RC-019).
+		if v > maxExtraLatency {
+			log.Warnf("EXTRA_LATENCY %v exceeds the %v cap; clamping", v, maxExtraLatency)
+			v = maxExtraLatency
+		}
+		if v < 0 {
+			v = 0
+		}
 		extraLatency = v
 		log.Infof("extra latency enabled (duration: %v)", extraLatency)
 	} else {
@@ -117,7 +138,13 @@ func main() {
 	}
 	log.Infof("starting grpc server at :%s", port)
 	run(port)
-	select {}
+
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	<-shutdownCtx.Done()
+	stop() // restore default signal handling, so a second signal aborts
+	log.Info("shutdown signal received, draining in-flight requests")
+	gracefulShutdown()
 }
 
 func run(port string) string {
@@ -145,7 +172,34 @@ func run(port string) string {
 	healthpb.RegisterHealthServer(srv, healthcheck)
 	go srv.Serve(listener)
 
+	runningSrv = srv
+	runningHealth = healthcheck
+
 	return listener.Addr().String()
+}
+
+// gracefulShutdown stops accepting new work, then waits for in-flight RPCs.
+// Kubernetes sends SIGTERM on pod termination; without this the process dies
+// at once and severs in-flight requests on every rollout (RC-018, RC-060).
+func gracefulShutdown() {
+	if runningHealth != nil {
+		runningHealth.Shutdown() // fail readiness before we stop serving
+	}
+	if runningSrv == nil {
+		return
+	}
+	drained := make(chan struct{})
+	go func() {
+		runningSrv.GracefulStop()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+		log.Info("shutdown complete")
+	case <-time.After(shutdownGracePeriod):
+		log.Warn("graceful shutdown timed out, forcing stop")
+		runningSrv.Stop()
+	}
 }
 
 func initStats() {

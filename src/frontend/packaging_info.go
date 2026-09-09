@@ -15,9 +15,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 )
@@ -29,6 +30,8 @@ This file contains code related to the frontend and the "packaging" microservice
 
 var (
 	packagingServiceUrl string
+
+	packagingHTTPClient = &http.Client{Timeout: packagingRequestTimeout}
 )
 
 type PackagingInfo struct {
@@ -47,11 +50,22 @@ func isPackagingServiceConfigured() bool {
 	return packagingServiceUrl != ""
 }
 
-func httpGetPackagingInfo(productId string) (*PackagingInfo, error) {
+// httpGetPackagingInfo fetches optional packaging metadata. It runs inline in
+// productHandler on every product page, so it carries the request context and
+// an explicit budget: the sibling getAd call is bounded to 100ms and this
+// optional lookup must not be able to outlive the page it decorates (RC-019).
+func httpGetPackagingInfo(ctx context.Context, productId string) (*PackagingInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, packagingRequestTimeout)
+	defer cancel()
+
 	// Make the GET request
 	url := packagingServiceUrl + "/" + productId
 	fmt.Println("Requesting packaging info from URL: ", url)
-	resp, err := http.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := packagingHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -62,8 +76,8 @@ func httpGetPackagingInfo(productId string) (*PackagingInfo, error) {
 		return nil, fmt.Errorf("Unexpected status code: %d", resp.StatusCode)
 	}
 
-	// Read the JSON response body
-	responseBody, err := ioutil.ReadAll(resp.Body)
+	// Read the JSON response body, capped so an upstream cannot exhaust memory
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxPackagingResponseBytes))
 	if err != nil {
 		return nil, err
 	}

@@ -50,6 +50,11 @@ public final class AdService {
 
   private static final AdService service = new AdService();
 
+  // Time allowed to drain in-flight GetAds calls after SIGTERM, then a hard cap
+  // on the forced stop that follows (RC-018, RC-060).
+  private static final long SHUTDOWN_GRACE_SECONDS = 20;
+  private static final long SHUTDOWN_FORCE_SECONDS = 5;
+
   private void start() throws IOException {
     int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "9555"));
     healthMgr = new HealthStatusManager();
@@ -74,10 +79,25 @@ public final class AdService {
     healthMgr.setStatus("", ServingStatus.SERVING);
   }
 
+  /**
+   * Stops the server and waits for in-flight calls to finish. server.shutdown() is non-blocking, so
+   * without the awaitTermination() below the shutdown hook returns immediately, the JVM halts, and
+   * the gRPC transport daemon threads are killed mid-call on every rollout (RC-018, RC-060).
+   */
   private void stop() {
     if (server != null) {
       healthMgr.clearStatus("");
       server.shutdown();
+      try {
+        if (!server.awaitTermination(SHUTDOWN_GRACE_SECONDS, TimeUnit.SECONDS)) {
+          System.err.println("*** graceful shutdown timed out, forcing stop");
+          server.shutdownNow();
+          server.awaitTermination(SHUTDOWN_FORCE_SECONDS, TimeUnit.SECONDS);
+        }
+      } catch (InterruptedException e) {
+        server.shutdownNow();
+        Thread.currentThread().interrupt();
+      }
     }
   }
 

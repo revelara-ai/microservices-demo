@@ -16,18 +16,31 @@ using System;
 using System.Linq;
 using System.Threading.Tasks;
 using Grpc.Core;
-using Microsoft.Extensions.Caching.Distributed;
 using Google.Protobuf;
+using StackExchange.Redis;
 
 namespace cartservice.cartstore
 {
+    /// <summary>
+    /// Cart store backed by a real Redis instance.
+    /// </summary>
+    /// <remarks>
+    /// Adding an item is a read-modify-write. Issued as a plain GET followed by a
+    /// SET it is not atomic: two concurrent AddItem calls for the same user both
+    /// read the same pre-state and the second write silently discards the first.
+    /// Every write below is therefore guarded by a WATCH-equivalent condition on
+    /// the value that was read, and retried when another writer got there first
+    /// (RC-013, RC-055).
+    /// </remarks>
     public class RedisCartStore : ICartStore
     {
-        private readonly IDistributedCache _cache;
+        private const int MaxWriteAttempts = 5;
 
-        public RedisCartStore(IDistributedCache cache)
+        private readonly IConnectionMultiplexer _redis;
+
+        public RedisCartStore(IConnectionMultiplexer redis)
         {
-            _cache = cache;
+            _redis = redis;
         }
 
         public async Task AddItemAsync(string userId, string productId, int quantity)
@@ -36,17 +49,23 @@ namespace cartservice.cartstore
 
             try
             {
-                Hipstershop.Cart cart;
-                var value = await _cache.GetAsync(userId);
-                if (value == null)
+                var db = _redis.GetDatabase();
+                RedisKey key = userId;
+
+                for (int attempt = 0; attempt < MaxWriteAttempts; attempt++)
                 {
-                    cart = new Hipstershop.Cart();
-                    cart.UserId = userId;
-                    cart.Items.Add(new Hipstershop.CartItem { ProductId = productId, Quantity = quantity });
-                }
-                else
-                {
-                    cart = Hipstershop.Cart.Parser.ParseFrom(value);
+                    RedisValue observed = await db.StringGetAsync(key);
+
+                    Hipstershop.Cart cart;
+                    if (observed.IsNullOrEmpty)
+                    {
+                        cart = new Hipstershop.Cart { UserId = userId };
+                    }
+                    else
+                    {
+                        cart = Hipstershop.Cart.Parser.ParseFrom((byte[])observed);
+                    }
+
                     var existingItem = cart.Items.SingleOrDefault(i => i.ProductId == productId);
                     if (existingItem == null)
                     {
@@ -56,8 +75,26 @@ namespace cartservice.cartstore
                     {
                         existingItem.Quantity += quantity;
                     }
+
+                    // Commit only if nobody else wrote this key since we read it.
+                    var transaction = db.CreateTransaction();
+                    transaction.AddCondition(observed.IsNullOrEmpty
+                        ? Condition.KeyNotExists(key)
+                        : Condition.StringEqual(key, observed));
+                    _ = transaction.StringSetAsync(key, cart.ToByteArray());
+
+                    if (await transaction.ExecuteAsync())
+                    {
+                        return;
+                    }
                 }
-                await _cache.SetAsync(userId, cart.ToByteArray());
+
+                throw new RpcException(new Status(StatusCode.Aborted,
+                    $"Could not update cart for {userId} after {MaxWriteAttempts} attempts due to concurrent writes."));
+            }
+            catch (RpcException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -71,8 +108,9 @@ namespace cartservice.cartstore
 
             try
             {
+                var db = _redis.GetDatabase();
                 var cart = new Hipstershop.Cart();
-                await _cache.SetAsync(userId, cart.ToByteArray());
+                await db.StringSetAsync(userId, cart.ToByteArray());
             }
             catch (Exception ex)
             {
@@ -86,12 +124,12 @@ namespace cartservice.cartstore
 
             try
             {
-                // Access the cart from the cache
-                var value = await _cache.GetAsync(userId);
+                var db = _redis.GetDatabase();
+                RedisValue value = await db.StringGetAsync(userId);
 
-                if (value != null)
+                if (!value.IsNullOrEmpty)
                 {
-                    return Hipstershop.Cart.Parser.ParseFrom(value);
+                    return Hipstershop.Cart.Parser.ParseFrom((byte[])value);
                 }
 
                 // We decided to return empty cart in cases when user wasn't in the cache before

@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"cloud.google.com/go/profiler"
@@ -35,6 +37,11 @@ import (
 
 const (
 	defaultPort = "50051"
+
+	// Time allowed to drain in-flight quotes and shipments after SIGTERM.
+	// Kubernetes sends SIGTERM on pod termination; a bare Serve() dies at once
+	// and severs in-flight requests on every rollout (RC-018, RC-060).
+	shutdownGracePeriod = 20 * time.Second
 )
 
 var log *logrus.Logger
@@ -96,8 +103,36 @@ func main() {
 
 	// Register reflection service on gRPC server.
 	reflection.Register(srv)
-	if err := srv.Serve(lis); err != nil {
-		log.Fatalf("failed to serve: %v", err)
+
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- srv.Serve(lis)
+	}()
+
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			log.Fatalf("failed to serve: %v", err)
+		}
+	case <-shutdownCtx.Done():
+		stop() // restore default signal handling, so a second signal aborts
+		log.Info("shutdown signal received, draining in-flight requests")
+		healthcheck.Shutdown() // fail readiness before we stop accepting work
+		drained := make(chan struct{})
+		go func() {
+			srv.GracefulStop()
+			close(drained)
+		}()
+		select {
+		case <-drained:
+			log.Info("shutdown complete")
+		case <-time.After(shutdownGracePeriod):
+			log.Warn("graceful shutdown timed out, forcing stop")
+			srv.Stop()
+		}
 	}
 }
 

@@ -13,19 +13,31 @@
 // limitations under the License.
 
 using System;
+using System.Text.RegularExpressions;
 using Grpc.Core;
 using Npgsql;
 using Microsoft.Extensions.Configuration;
 using System.Threading.Tasks;
 using Google.Api.Gax.ResourceNames;
 using Google.Cloud.SecretManager.V1;
- 
+
 namespace cartservice.cartstore
 {
-    public class AlloyDBCartStore : ICartStore
+    public class AlloyDBCartStore : ICartStore, IAsyncDisposable
     {
+        // Bound the pool and every statement. Without these a slow query holds
+        // connections until the pool saturates, and a saturated pool is what
+        // turns one slow query into a service-wide outage (RC-055, RC-019).
+        private const int MaxPoolSize = 50;
+        private const int ConnectTimeoutSeconds = 5;
+        private const int CommandTimeoutSeconds = 5;
+
         private readonly string tableName;
-        private readonly string connectionString;
+
+        // NpgsqlDataSource owns the connection pool and is designed to live for
+        // the process. Creating one per RPC — as this store used to — builds and
+        // tears down a whole pool on every call (RC-055).
+        private readonly NpgsqlDataSource dataSource;
 
         public AlloyDBCartStore(IConfiguration configuration)
         {
@@ -38,7 +50,7 @@ namespace cartservice.cartstore
             AccessSecretVersionResponse result = client.AccessSecretVersion(secretVersionName);
             // Convert the payload to a string. Payloads are bytes by default.
             string alloyDBPassword = result.Payload.Data.ToStringUtf8().TrimEnd('\r', '\n');
-        
+
             // TODO: Create a separate user for connecting within the application
             // rather than using our superuser
             string alloyDBUser = "postgres";
@@ -46,60 +58,63 @@ namespace cartservice.cartstore
             // TODO: Consider splitting workloads into read vs. write and take
             // advantage of the AlloyDB read pools
             string primaryIPAddress = configuration["ALLOYDB_PRIMARY_IP"];
-            connectionString = "Host="          +
-                               primaryIPAddress +
-                               ";Username="     +
-                               alloyDBUser      +
-                               ";Password="     +
-                               alloyDBPassword  +
-                               ";Database="     +
-                               databaseName;
 
-            tableName = configuration["ALLOYDB_TABLE_NAME"];
+            var connectionStringBuilder = new NpgsqlConnectionStringBuilder
+            {
+                Host = primaryIPAddress,
+                Username = alloyDBUser,
+                Password = alloyDBPassword,
+                Database = databaseName,
+                MaxPoolSize = MaxPoolSize,
+                Timeout = ConnectTimeoutSeconds,
+                CommandTimeout = CommandTimeoutSeconds
+            };
+
+            tableName = QuoteIdentifier(configuration["ALLOYDB_TABLE_NAME"]);
+            dataSource = NpgsqlDataSource.Create(connectionStringBuilder.ConnectionString);
         }
 
-
-    public async Task AddItemAsync(string userId, string productId, int quantity)
-    {
-        Console.WriteLine($"AddItemAsync for {userId} called");
-        try
+        // A table name is an identifier, so it cannot be a query parameter. It
+        // comes from configuration rather than from a request, but quote it and
+        // reject anything that is not a plain identifier so it can never be a
+        // vector for statement injection (RC-044).
+        private static string QuoteIdentifier(string identifier)
         {
-            await using var dataSource = NpgsqlDataSource.Create(connectionString);
-
-            var fetchCmd = $"SELECT quantity FROM {tableName} WHERE userID='{userId}' AND productID='{productId}'";
-            var currentQuantity = 0;
-            var cmdRead = dataSource.CreateCommand(fetchCmd);
-            await using (var reader = await cmdRead.ExecuteReaderAsync())
+            if (string.IsNullOrWhiteSpace(identifier) || !Regex.IsMatch(identifier, "^[A-Za-z_][A-Za-z0-9_]*$"))
             {
-                while (await reader.ReadAsync())
-                    currentQuantity += reader.GetInt32(0);
+                throw new ArgumentException($"ALLOYDB_TABLE_NAME is not a valid identifier: {identifier}");
             }
+            return "\"" + identifier + "\"";
+        }
 
-            var totalQuantity = quantity + currentQuantity;
-
-            // Use INSERT ... ON CONFLICT to prevent duplicate key error
-            var insertCmd = $@"
-                INSERT INTO {tableName} (userId, productId, quantity)
-                VALUES ('{userId}', '{productId}', {totalQuantity})
-                ON CONFLICT (userId, productId)
-                DO UPDATE SET quantity = {totalQuantity};
-            ";
-
-            await using (var cmdInsert = dataSource.CreateCommand(insertCmd))
+        public async Task AddItemAsync(string userId, string productId, int quantity)
+        {
+            Console.WriteLine($"AddItemAsync for {userId} called");
+            try
             {
-                await Task.Run(() =>
-                {
-                    return cmdInsert.ExecuteNonQueryAsync();
-                });
+                // One atomic statement. The previous SELECT-then-INSERT computed
+                // the new quantity in process memory, so two concurrent AddItem
+                // calls for the same user both read the same pre-state and the
+                // second write silently discarded the first (RC-013, RC-055).
+                var upsertCmd = $@"
+                    INSERT INTO {tableName} (userId, productId, quantity)
+                    VALUES (@userId, @productId, @quantity)
+                    ON CONFLICT (userId, productId)
+                    DO UPDATE SET quantity = {tableName}.quantity + EXCLUDED.quantity;
+                ";
+
+                await using var cmd = dataSource.CreateCommand(upsertCmd);
+                cmd.Parameters.AddWithValue("userId", userId);
+                cmd.Parameters.AddWithValue("productId", productId);
+                cmd.Parameters.AddWithValue("quantity", quantity);
+                await cmd.ExecuteNonQueryAsync();
+            }
+            catch (Exception ex)
+            {
+                throw new RpcException(
+                    new Status(StatusCode.FailedPrecondition, $"Unable to access cart storage due to an internal error. {ex}"));
             }
         }
-        catch (Exception ex)
-        {   
-            throw new RpcException(
-                new Status(StatusCode.FailedPrecondition, $"Unable to access cart storage due to an internal error. {ex}"));
-        }
-    }
-
 
         public async Task<Hipstershop.Cart> GetCartAsync(string userId)
         {
@@ -108,26 +123,20 @@ namespace cartservice.cartstore
             cart.UserId = userId;
             try
             {
-                await using var dataSource = NpgsqlDataSource.Create(connectionString);
+                await using var cmd = dataSource.CreateCommand(
+                    $"SELECT productId, quantity FROM {tableName} WHERE userId = @userId");
+                cmd.Parameters.AddWithValue("userId", userId);
 
-                var cartFetchCmd = $"SELECT productId, quantity FROM {tableName} WHERE userId = '{userId}'";
-                var cmd = dataSource.CreateCommand(cartFetchCmd);
-                await using (var reader = await cmd.ExecuteReaderAsync())
+                await using var reader = await cmd.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
                 {
-                    while (await reader.ReadAsync())
+                    Hipstershop.CartItem item = new()
                     {
-                        Hipstershop.CartItem item = new()
-                        {
-                            ProductId = reader.GetString(0),
-                            Quantity = reader.GetInt32(1)
-                        };
-                        cart.Items.Add(item);
-                    }
+                        ProductId = reader.GetString(0),
+                        Quantity = reader.GetInt32(1)
+                    };
+                    cart.Items.Add(item);
                 }
-                await Task.Run(() =>
-                {
-                    return cart;
-                });
             }
             catch (Exception ex)
             {
@@ -137,22 +146,16 @@ namespace cartservice.cartstore
             return cart;
         }
 
-
         public async Task EmptyCartAsync(string userId)
         {
             Console.WriteLine($"EmptyCartAsync called for userId={userId}");
 
             try
             {
-                await using var dataSource = NpgsqlDataSource.Create(connectionString);
-                var deleteCmd = $"DELETE FROM {tableName} WHERE userID = '{userId}'";
-                await using (var cmd = dataSource.CreateCommand(deleteCmd))
-                {
-                    await Task.Run(() =>
-                    {
-                        return cmd.ExecuteNonQueryAsync();
-                    });
-                }
+                await using var cmd = dataSource.CreateCommand(
+                    $"DELETE FROM {tableName} WHERE userId = @userId");
+                cmd.Parameters.AddWithValue("userId", userId);
+                await cmd.ExecuteNonQueryAsync();
             }
             catch (Exception ex)
             {
@@ -172,6 +175,11 @@ namespace cartservice.cartstore
                 return false;
             }
         }
+
+        public async ValueTask DisposeAsync()
+        {
+            await dataSource.DisposeAsync();
+            GC.SuppressFinalize(this);
+        }
     }
 }
-

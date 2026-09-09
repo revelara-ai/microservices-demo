@@ -30,7 +30,7 @@ spec:
         sidecar.istio.io/rewriteAppHTTPProbers: "true"
     spec:
       serviceAccountName: loadgenerator
-      terminationGracePeriodSeconds: 5
+      terminationGracePeriodSeconds: 30
       restartPolicy: Always
       securityContext:
         fsGroup: 1000

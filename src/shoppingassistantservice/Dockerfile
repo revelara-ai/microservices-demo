@@ -44,4 +44,7 @@ COPY . .
 ENV PORT="8080"
 EXPOSE 8080
 
-ENTRYPOINT ["python", "shoppingassistantservice.py"]
+# Serve with a production WSGI server. The Werkzeug development server handles
+# one request at a time, so a single slow Gemini call blocked the whole service
+# (RC-062, RC-067). --graceful-timeout drains workers on SIGTERM (RC-018).
+ENTRYPOINT ["sh", "-c", "exec gunicorn --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 60 --graceful-timeout 20 shoppingassistantservice:app"]

@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 
 from google.cloud import secretmanager_v1
@@ -31,6 +32,17 @@ ALLOYDB_TABLE_NAME = os.environ["ALLOYDB_TABLE_NAME"]
 ALLOYDB_CLUSTER_NAME = os.environ["ALLOYDB_CLUSTER_NAME"]
 ALLOYDB_INSTANCE_NAME = os.environ["ALLOYDB_INSTANCE_NAME"]
 ALLOYDB_SECRET_NAME = os.environ["ALLOYDB_SECRET_NAME"]
+
+# Bound every outbound call. None of ChatGoogleGenerativeAI,
+# GoogleGenerativeAIEmbeddings or the AlloyDB vector store applies a default
+# timeout, and this request path chains three of them, so one slow Gemini
+# response otherwise occupies a request-handling thread for its full duration
+# (RC-019, RC-062).
+GEMINI_TIMEOUT_SECONDS = float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "30"))
+GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "2"))
+VECTOR_SEARCH_RESULT_LIMIT = int(os.environ.get("VECTOR_SEARCH_RESULT_LIMIT", "4"))
+
+logger = logging.getLogger(__name__)
 
 secret_manager_client = secretmanager_v1.SecretManagerServiceClient()
 secret_name = secret_manager_client.secret_version_path(project=PROJECT_ID, secret=ALLOYDB_SECRET_NAME, secret_version="latest")
@@ -52,7 +64,9 @@ engine = AlloyDBEngine.from_instance(
 vectorstore = AlloyDBVectorStore.create_sync(
     engine=engine,
     table_name=ALLOYDB_TABLE_NAME,
-    embedding_service=GoogleGenerativeAIEmbeddings(model="models/embedding-001"),
+    embedding_service=GoogleGenerativeAIEmbeddings(
+        model="models/embedding-001",
+        request_options={"timeout": GEMINI_TIMEOUT_SECONDS}),
     id_column="id",
     content_column="description",
     embedding_column="product_embedding",
@@ -69,7 +83,10 @@ def create_app():
         prompt = unquote(prompt)
 
         # Step 1 – Get a room description from Gemini-vision-pro
-        llm_vision = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
+        llm_vision = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            timeout=GEMINI_TIMEOUT_SECONDS,
+            max_retries=GEMINI_MAX_RETRIES)
         message = HumanMessage(
             content=[
                 {
@@ -88,7 +105,7 @@ def create_app():
         vector_search_prompt = f""" This is the user's request: {prompt} Find the most relevant items for that prompt, while matching style of the room described here: {description_response} """
         print(vector_search_prompt)
 
-        docs = vectorstore.similarity_search(vector_search_prompt)
+        docs = vectorstore.similarity_search(vector_search_prompt, k=VECTOR_SEARCH_RESULT_LIMIT)
         print(f"Vector search: {description_response}")
         print(f"Retrieved documents: {len(docs)}")
         #Prepare relevant documents for inclusion in final prompt
@@ -99,7 +116,10 @@ def create_app():
             relevant_docs += str(doc_details) + ", "
 
         # Step 3 – Tie it all together by augmenting our call to Gemini-pro
-        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            timeout=GEMINI_TIMEOUT_SECONDS,
+            max_retries=GEMINI_MAX_RETRIES)
         design_prompt = (
             f" You are an interior designer that works for Online Boutique. You are tasked with providing recommendations to a customer on what they should add to a given room from our catalog. This is the description of the room: \n"
             f"{description_response} Here are a list of products that are relevant to it: {relevant_docs} Specifically, this is what the customer has asked for, see if you can accommodate it: {prompt} Start by repeating a brief description of the room's design to the customer, then provide your recommendations. Do your best to pick the most relevant item out of the list of products provided, but if none of them seem relevant, then say that instead of inventing a new product. At the end of the response, add a list of the IDs of the relevant products in the following format for the top 3 results: [<first product ID>], [<second product ID>], [<third product ID>] ")
@@ -112,9 +132,22 @@ def create_app():
         data = {'content': design_response.content}
         return data
 
+    @app.errorhandler(Exception)
+    def handleAssistantFailure(err):
+        # Degrade instead of leaking a traceback. A timeout or an unreachable
+        # Gemini endpoint now ends the request quickly with a usable message
+        # rather than holding a worker (RC-018, RC-062).
+        logger.exception("shopping assistant request failed")
+        return {'content': "Sorry, the shopping assistant is unavailable right now. Please try again."}, 503
+
     return app
 
+# Module-level WSGI application, so a production server (gunicorn) can serve it
+# with a real worker and thread count. The Werkzeug development server handles
+# one request at a time, which turns any slow Gemini call into a full outage of
+# this service (RC-062, RC-067).
+app = create_app()
+
 if __name__ == "__main__":
-    # Create an instance of flask server when called directly
-    app = create_app()
-    app.run(host='0.0.0.0', port=8080)
+    # Development only. The container entrypoint runs gunicorn instead.
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", "8080")))

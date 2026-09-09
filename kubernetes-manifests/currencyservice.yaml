@@ -28,7 +28,7 @@ spec:
         app: currencyservice
     spec:
       serviceAccountName: currencyservice
-      terminationGracePeriodSeconds: 5
+      terminationGracePeriodSeconds: 30
       securityContext:
         fsGroup: 1000
         runAsGroup: 1000

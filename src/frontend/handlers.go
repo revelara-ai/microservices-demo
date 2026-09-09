@@ -42,7 +42,22 @@ type platformDetails struct {
 	provider string
 }
 
+const (
+	// Every outbound HTTP call gets an explicit budget. http.DefaultClient has
+	// no Timeout at all, so a hung dependency pins the handler goroutine and
+	// its connection even after the browser disconnects (RC-019).
+	assistantRequestTimeout = 30 * time.Second
+	packagingRequestTimeout = 3 * time.Second
+
+	// Cap what we are willing to read from an upstream. An unbounded
+	// io.ReadAll lets a misbehaving dependency exhaust frontend memory.
+	maxAssistantResponseBytes = 1 << 20 // 1 MiB
+	maxPackagingResponseBytes = 64 << 10
+)
+
 var (
+	assistantHTTPClient = &http.Client{Timeout: assistantRequestTimeout}
+
 	frontendMessage  = strings.TrimSpace(os.Getenv("FRONTEND_MESSAGE"))
 	isCymbalBrand    = "true" == strings.ToLower(os.Getenv("CYMBAL_BRANDING"))
 	assistantEnabled = "true" == strings.ToLower(os.Getenv("ENABLE_ASSISTANT"))
@@ -189,7 +204,7 @@ func (fe *frontendServer) productHandler(w http.ResponseWriter, r *http.Request)
 	// The packaging service is an optional microservice you can run as part of a Google Cloud demo.
 	var packagingInfo *PackagingInfo = nil
 	if isPackagingServiceConfigured() {
-		packagingInfo, err = httpGetPackagingInfo(id)
+		packagingInfo, err = httpGetPackagingInfo(r.Context(), id)
 		if err != nil {
 			fmt.Println("Failed to obtain product's packaging info:", err)
 		}
@@ -461,21 +476,25 @@ func (fe *frontendServer) chatBotHandler(w http.ResponseWriter, r *http.Request)
 
 	var response LLMResponse
 
+	ctx, cancel := context.WithTimeout(r.Context(), assistantRequestTimeout)
+	defer cancel()
+
 	url := "http://" + fe.shoppingAssistantSvcAddr
-	req, err := http.NewRequest(http.MethodPost, url, r.Body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, r.Body)
 	if err != nil {
 		renderHTTPError(log, r, w, errors.Wrap(err, "failed to create request"), http.StatusInternalServerError)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	res, err := http.DefaultClient.Do(req)
+	res, err := assistantHTTPClient.Do(req)
 	if err != nil {
 		renderHTTPError(log, r, w, errors.Wrap(err, "failed to send request"), http.StatusInternalServerError)
 		return
 	}
+	defer res.Body.Close()
 
-	body, err := io.ReadAll(res.Body)
+	body, err := io.ReadAll(io.LimitReader(res.Body, maxAssistantResponseBytes))
 	if err != nil {
 		renderHTTPError(log, r, w, errors.Wrap(err, "failed to read response"), http.StatusInternalServerError)
 		return

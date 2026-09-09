@@ -38,14 +38,36 @@ func (p *productCatalog) Watch(req *healthpb.HealthCheckRequest, ws healthpb.Hea
 	return status.Errorf(codes.Unimplemented, "health check via Watch not implemented")
 }
 
-func (p *productCatalog) ListProducts(context.Context, *pb.Empty) (*pb.ListProductsResponse, error) {
-	time.Sleep(extraLatency)
+// sleepExtraLatency applies the injected EXTRA_LATENCY demo delay while still
+// observing the caller's deadline. A bare time.Sleep is deaf to cancellation,
+// so an expired deadline or a disconnected client still held the goroutine for
+// the full duration (RC-019).
+func sleepExtraLatency(ctx context.Context) error {
+	if extraLatency <= 0 {
+		return nil
+	}
+	t := time.NewTimer(extraLatency)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return status.FromContextError(ctx.Err()).Err()
+	}
+}
+
+func (p *productCatalog) ListProducts(ctx context.Context, _ *pb.Empty) (*pb.ListProductsResponse, error) {
+	if err := sleepExtraLatency(ctx); err != nil {
+		return nil, err
+	}
 
 	return &pb.ListProductsResponse{Products: p.parseCatalog()}, nil
 }
 
 func (p *productCatalog) GetProduct(ctx context.Context, req *pb.GetProductRequest) (*pb.Product, error) {
-	time.Sleep(extraLatency)
+	if err := sleepExtraLatency(ctx); err != nil {
+		return nil, err
+	}
 
 	catalog := p.parseCatalog()
 	for _, product := range catalog {
@@ -58,7 +80,9 @@ func (p *productCatalog) GetProduct(ctx context.Context, req *pb.GetProductReque
 }
 
 func (p *productCatalog) SearchProducts(ctx context.Context, req *pb.SearchProductsRequest) (*pb.SearchProductsResponse, error) {
-	time.Sleep(extraLatency)
+	if err := sleepExtraLatency(ctx); err != nil {
+		return nil, err
+	}
 
 	var ps []*pb.Product
 	for _, product := range p.parseCatalog() {

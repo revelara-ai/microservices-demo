@@ -17,7 +17,9 @@
 from concurrent import futures
 import argparse
 import os
+import signal
 import sys
+import threading
 import time
 import grpc
 import traceback
@@ -115,6 +117,10 @@ class HealthCheck():
     return health_pb2.HealthCheckResponse(
       status=health_pb2.HealthCheckResponse.SERVING)
 
+# Time allowed to drain in-flight RPCs after SIGTERM (RC-018, RC-060).
+SHUTDOWN_GRACE_SECONDS = float(os.environ.get('SHUTDOWN_GRACE_SECONDS', '20'))
+
+
 def start(dummy_mode):
   server = grpc.server(futures.ThreadPoolExecutor(max_workers=10),)
   service = None
@@ -130,11 +136,24 @@ def start(dummy_mode):
   logger.info("listening on port: "+port)
   server.add_insecure_port('[::]:'+port)
   server.start()
+  # Python raises KeyboardInterrupt only for SIGINT. Kubernetes sends SIGTERM on
+  # pod termination, and the default SIGTERM handler kills the interpreter
+  # without draining in-flight RPCs (RC-018, RC-060).
+  stop_requested = threading.Event()
+
+  def _handle_sigterm(signum, _frame):
+    logger.info('received signal {}, draining in-flight requests'.format(signum))
+    stop_requested.set()
+
+  signal.signal(signal.SIGTERM, _handle_sigterm)
+
   try:
-    while True:
-      time.sleep(3600)
+    stop_requested.wait()
   except KeyboardInterrupt:
-    server.stop(0)
+    logger.info('received SIGINT, draining in-flight requests')
+
+  server.stop(SHUTDOWN_GRACE_SECONDS).wait(SHUTDOWN_GRACE_SECONDS)
+  logger.info('shutdown complete')
 
 def initStackdriverProfiling():
   project_id = None

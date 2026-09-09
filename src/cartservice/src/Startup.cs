@@ -9,7 +9,7 @@ using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Hosting;
 using cartservice.cartstore;
 using cartservice.services;
-using Microsoft.Extensions.Caching.StackExchangeRedis;
+using StackExchange.Redis;
 
 namespace cartservice
 {
@@ -21,6 +21,11 @@ namespace cartservice
         }
 
         public IConfiguration Configuration { get; }
+
+        private const int RedisConnectTimeoutMilliseconds = 5000;
+        private const int RedisCommandTimeoutMilliseconds = 5000;
+        private const int RedisConnectRetries = 3;
+
         
         // This method gets called by the runtime. Use this method to add services to the container.
         // For more information on how to configure your application, visit https://go.microsoft.com/fwlink/?LinkID=398940
@@ -33,10 +38,21 @@ namespace cartservice
 
             if (!string.IsNullOrEmpty(redisAddress))
             {
-                services.AddStackExchangeRedisCache(options =>
-                {
-                    options.Configuration = redisAddress;
-                });
+                // Connect through the multiplexer rather than IDistributedCache:
+                // the cache abstraction has no compare-and-set, so an atomic
+                // read-modify-write for AddItem is impossible on top of it
+                // (RC-013, RC-055).
+                var redisOptions = ConfigurationOptions.Parse(redisAddress);
+                // Bound the connection and every command, and keep starting when
+                // Redis is briefly unreachable instead of failing to boot
+                // (RC-019, RC-018).
+                redisOptions.AbortOnConnectFail = false;
+                redisOptions.ConnectTimeout = RedisConnectTimeoutMilliseconds;
+                redisOptions.SyncTimeout = RedisCommandTimeoutMilliseconds;
+                redisOptions.ConnectRetry = RedisConnectRetries;
+
+                services.AddSingleton<IConnectionMultiplexer>(
+                    _ => ConnectionMultiplexer.Connect(redisOptions));
                 services.AddSingleton<ICartStore, RedisCartStore>();
             }
             else if (!string.IsNullOrEmpty(spannerProjectId) || !string.IsNullOrEmpty(spannerConnectionString))
@@ -52,7 +68,7 @@ namespace cartservice
             {
                 Console.WriteLine("Redis cache host(hostname+port) was not specified. Starting a cart service using in memory store");
                 services.AddDistributedMemoryCache();
-                services.AddSingleton<ICartStore, RedisCartStore>();
+                services.AddSingleton<ICartStore, LocalCartStore>();
             }
 
 

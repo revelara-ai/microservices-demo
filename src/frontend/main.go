@@ -16,14 +16,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"cloud.google.com/go/profiler"
 	"github.com/gorilla/mux"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -39,6 +42,19 @@ const (
 	port            = "8080"
 	defaultCurrency = "USD"
 	cookieMaxAge    = 60 * 60 * 48
+
+	// Bound the chain root. Without these every http.Server timeout field is
+	// zero, so a slow client or a hung dependency holds a connection and its
+	// goroutine open indefinitely (RC-019).
+	srvReadHeaderTimeout = 5 * time.Second
+	srvReadTimeout       = 15 * time.Second
+	srvWriteTimeout      = 30 * time.Second
+	srvIdleTimeout       = 120 * time.Second
+
+	// Time allowed to drain in-flight requests after SIGTERM. Kubernetes sends
+	// SIGTERM on pod termination; without a handler the process dies at once
+	// and severs in-flight work on every rollout (RC-018, RC-060).
+	shutdownGracePeriod = 20 * time.Second
 
 	cookiePrefix    = "shop_"
 	cookieSessionID = cookiePrefix + "session-id"
@@ -167,8 +183,43 @@ func main() {
 	handler = ensureSessionID(handler)                 // add session ID
 	handler = otelhttp.NewHandler(handler, "frontend") // add OTel tracing
 
-	log.Infof("starting server on %s:%s", addr, srvPort)
-	log.Fatal(http.ListenAndServe(addr+":"+srvPort, handler))
+	srv := &http.Server{
+		Addr:              addr + ":" + srvPort,
+		Handler:           handler,
+		ReadHeaderTimeout: srvReadHeaderTimeout,
+		ReadTimeout:       srvReadTimeout,
+		WriteTimeout:      srvWriteTimeout,
+		IdleTimeout:       srvIdleTimeout,
+	}
+
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	serveErr := make(chan error, 1)
+	go func() {
+		log.Infof("starting server on %s:%s", addr, srvPort)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+		}
+		close(serveErr)
+	}()
+
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			log.Fatal(err)
+		}
+	case <-shutdownCtx.Done():
+		stop() // restore default signal handling, so a second signal aborts
+		log.Info("shutdown signal received, draining in-flight requests")
+		drainCtx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
+		defer cancel()
+		if err := srv.Shutdown(drainCtx); err != nil {
+			log.Warnf("graceful shutdown did not complete: %+v", err)
+		} else {
+			log.Info("shutdown complete")
+		}
+	}
 }
 func initStats(log logrus.FieldLogger) {
 	// TODO(arbrown) Implement OpenTelemtry stats
@@ -222,14 +273,15 @@ func mustMapEnv(target *string, envKey string) {
 	*target = v
 }
 
-func mustConnGRPC(ctx context.Context, conn **grpc.ClientConn, addr string) {
+// mustConnGRPC establishes a lazily-connecting client. grpc.NewClient takes no
+// context, so no timeout belongs here; per-RPC deadlines are set at the call
+// sites instead (RC-019).
+func mustConnGRPC(_ context.Context, conn **grpc.ClientConn, addr string) {
 	var err error
-	_, cancel := context.WithTimeout(ctx, time.Second*3)
-	defer cancel()
 	*conn, err = grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 	if err != nil {
-		panic(errors.Wrapf(err, "grpc: failed to connect %s", addr))
+		panic(pkgerrors.Wrapf(err, "grpc: failed to connect %s", addr))
 	}
 }
